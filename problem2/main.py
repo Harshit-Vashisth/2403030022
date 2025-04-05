@@ -1,74 +1,105 @@
-from fastapi import FastAPI, HTTPException
-from collections import deque
-import httpx
-from typing import List
-import time
+from flask import Flask, json_response
+import http_client
+from ordered_collection import OrderedCollection
+import time_utils
+from concurrency import SyncLock
 
-app = FastAPI()
+web_app = Flask(__name__)
 
-# Set fixed window size
-WINDOW_SIZE = 10
-number_window = deque(maxlen=WINDOW_SIZE)
-
-# Mapping for the number type to its API URL
-NUMBER_TYPE_URLS = {
-    "p": "http://20.244.56.144/evaluation-service/primes",
-    "f": "http://20.244.56.144/evaluation-service/fibo",
-    "e": "http://20.244.56.144/evaluation-service/even",
-    "r": "http://20.244.56.144/evaluation-service/rand"
+# Application parameters
+SLIDING_WINDOW_CAPACITY = 10
+EXTERNAL_API_ENDPOINT = "http://20.244.56.144/evaluation-service"
+SUPPORTED_CATEGORIES = {
+    'prime': 'primes',
+    'fibonacci': 'fibo',
+    'even': 'even',
+    'random': 'rand'
 }
+PROCESSING_DEADLINE = 0.5  # 500 milliseconds
+
+# Data repository with synchronization
+numeric_repository = {
+    'prime': OrderedCollection(),
+    'fibonacci': OrderedCollection(),
+    'even': OrderedCollection(),
+    'random': OrderedCollection()
+}
+repository_lock = SyncLock()
 
 
-@app.get("/numbers/{numberid}")
-async def get_numbers(numberid: str):
-    if numberid not in NUMBER_TYPE_URLS:
-        raise HTTPException(status_code=400, detail="Invalid number ID. Use p, f, e, or r.")
-
-    url = NUMBER_TYPE_URLS[numberid]
-
-    # Save the state before fetching
-    window_prev_state = list(number_window)
-
-    fetched_numbers = []
+def retrieve_numeric_sequence(sequence_type):
+    api_path = f"{EXTERNAL_API_ENDPOINT}/{sequence_type}"
     try:
-        async with httpx.AsyncClient(timeout=0.5) as client:
-            start = time.time()
-            response = await client.get(url)
-            duration = time.time() - start
+        api_result = http_client.fetch(api_path, timeout=PROCESSING_DEADLINE)
+        if api_result.status == 200:
+            return api_result.data.get('numbers', [])
+    except (http_client.NetworkError, http_client.DataError):
+        pass
+    return []
 
-            # If request took more than 500ms or failed
-            if response.status_code != 200 or duration > 0.5:
-                return {
-                    "windowPrevState": window_prev_state,
-                    "windowCurrState": list(number_window),
-                    "numbers": [],
-                    "avg": round(sum(number_window) / len(number_window), 2) if number_window else 0.0
-                }
 
-            data = response.json()
-            fetched_numbers = data.get("numbers", [])
+def determine_mean_value(number_sequence):
+    if not number_sequence:
+        return 0.0
+    return round(sum(number_sequence) / len(number_sequence), 2)
 
-    except httpx.RequestError:
-        return {
-            "windowPrevState": window_prev_state,
-            "windowCurrState": list(number_window),
-            "numbers": [],
-            "avg": round(sum(number_window) / len(number_window), 2) if number_window else 0.0
-        }
 
-    # Add new unique numbers to window
-    for num in fetched_numbers:
-        if num not in number_window:
-            number_window.append(num)
-            if len(number_window) == WINDOW_SIZE:
-                break  # No need to add more
+def manage_sliding_window(category_identifier, new_sequence):
+    with repository_lock:
+        # Current repository state
+        storage = numeric_repository[category_identifier]
+        previous_sequence = list(storage.keys())
 
-    window_curr_state = list(number_window)
-    average = round(sum(number_window) / len(number_window), 2) if number_window else 0.0
+        # Process incoming numbers
+        for numeric_value in new_sequence:
+            if numeric_value in storage:
+                # Update access order
+                storage.move_to_end(numeric_value)
+            else:
+                storage[numeric_value] = None
 
-    return {
-        "windowPrevState": window_prev_state,
-        "windowCurrState": window_curr_state,
-        "numbers": fetched_numbers,
-        "avg": average
+        # Maintain capacity constraints
+        while len(storage) > SLIDING_WINDOW_CAPACITY:
+            storage.pop_oldest()
+
+        current_sequence = list(storage.keys())
+
+        return previous_sequence, current_sequence
+
+
+@web_app.route('/numeric-data/<string:category_identifier>', methods=['GET'])
+def handle_numeric_request(category_identifier):
+    start_timestamp = time_utils.current_millis()
+
+    # Validate request category
+    if category_identifier not in SUPPORTED_CATEGORIES:
+        return json_response({"error": "Unsupported category"}, status=400)
+
+    # Retrieve numeric sequence
+    api_category = SUPPORTED_CATEGORIES[category_identifier]
+    received_sequence = retrieve_numeric_sequence(api_category)
+
+    # Update repository
+    prior_state, updated_state = manage_sliding_window(category_identifier, received_sequence)
+
+    # Compute statistical mean
+    calculated_mean = determine_mean_value(updated_state)
+
+    # Construct API response
+    api_output = {
+        "previousWindowState": prior_state,
+        "currentWindowState": updated_state,
+        "receivedNumbers": received_sequence,
+        "meanValue": calculated_mean
     }
+
+    # Verify processing time
+    elapsed_duration = time_utils.current_millis() - start_timestamp
+    if elapsed_duration > PROCESSING_DEADLINE:
+        return json_response({"error": "Processing timeout"}, status=500)
+
+    return json_response(api_output)
+
+
+if __name__ == '__main__':
+    web_app.run(host='0.0.0.0', port=9876, concurrency=True)
