@@ -1,105 +1,126 @@
-from flask import Flask, json_response
-import http_client
-from ordered_collection import OrderedCollection
-import time_utils
-from concurrency import SyncLock
+from flask import Flask, jsonify as format_response, abort as reject_request
+import requests as http_client
+from collections import OrderedDict as NumberSequence
+import time as timer
+from threading import Lock as AccessController
+from concurrent.futures import ThreadPoolExecutor as AsyncTaskManager
 
-web_app = Flask(__name__)
+calculation_service = Flask(__name__)
 
-# Application parameters
-SLIDING_WINDOW_CAPACITY = 10
+# System configuration
+DATA_WINDOW_CAPACITY = 10
 EXTERNAL_API_ENDPOINT = "http://20.244.56.144/evaluation-service"
-SUPPORTED_CATEGORIES = {
+SUPPORTED_NUMBER_TYPES = {
     'prime': 'primes',
     'fibonacci': 'fibo',
     'even': 'even',
     'random': 'rand'
 }
-PROCESSING_DEADLINE = 0.5  # 500 milliseconds
+PROCESSING_DEADLINE = 0.5  # 500ms
 
-# Data repository with synchronization
-numeric_repository = {
-    'prime': OrderedCollection(),
-    'fibonacci': OrderedCollection(),
-    'even': OrderedCollection(),
-    'random': OrderedCollection()
+# Data repository
+number_repository = {
+    'prime': NumberSequence(),
+    'fibonacci': NumberSequence(),
+    'even': NumberSequence(),
+    'random': NumberSequence()
 }
-repository_lock = SyncLock()
+repository_lock = AccessController()
+
+# Async task handler
+task_handler = AsyncTaskManager(max_workers=4)
 
 
-def retrieve_numeric_sequence(sequence_type):
-    api_path = f"{EXTERNAL_API_ENDPOINT}/{sequence_type}"
+def retrieve_number_sequence(sequence_category):
+    """Obtain numbers from external data provider"""
+    api_endpoint = f"{EXTERNAL_API_ENDPOINT}/{sequence_category}"
     try:
-        api_result = http_client.fetch(api_path, timeout=PROCESSING_DEADLINE)
-        if api_result.status == 200:
-            return api_result.data.get('numbers', [])
-    except (http_client.NetworkError, http_client.DataError):
+        api_response = http_client.get(api_endpoint, timeout=PROCESSING_DEADLINE)
+        if api_response.status_code == 200:
+            return api_response.json().get('numbers', [])
+    except (http_client.exceptions.RequestException, ValueError):
         pass
     return []
 
 
-def determine_mean_value(number_sequence):
-    if not number_sequence:
+def compute_mean_value(number_collection):
+    """Calculate arithmetic mean of numbers"""
+    if not number_collection:
         return 0.0
-    return round(sum(number_sequence) / len(number_sequence), 2)
+    return round(sum(number_collection) / len(number_collection), 2)
 
 
-def manage_sliding_window(category_identifier, new_sequence):
+def update_data_repository(category_id, incoming_numbers):
+    """Maintain sliding window of numbers"""
     with repository_lock:
-        # Current repository state
-        storage = numeric_repository[category_identifier]
-        previous_sequence = list(storage.keys())
+        data_store = number_repository[category_id]
+        previous_numbers = list(data_store.keys())
 
-        # Process incoming numbers
-        for numeric_value in new_sequence:
-            if numeric_value in storage:
+        # Process new numbers
+        for num in incoming_numbers:
+            if num in data_store:
                 # Update access order
-                storage.move_to_end(numeric_value)
+                data_store.move_to_end(num)
             else:
-                storage[numeric_value] = None
+                data_store[num] = None
 
-        # Maintain capacity constraints
-        while len(storage) > SLIDING_WINDOW_CAPACITY:
-            storage.pop_oldest()
+        # Enforce capacity limits
+        while len(data_store) > DATA_WINDOW_CAPACITY:
+            data_store.popitem(last=False)
 
-        current_sequence = list(storage.keys())
+        current_numbers = list(data_store.keys())
 
-        return previous_sequence, current_sequence
+        return previous_numbers, current_numbers
 
 
-@web_app.route('/numeric-data/<string:category_identifier>', methods=['GET'])
-def handle_numeric_request(category_identifier):
-    start_timestamp = time_utils.current_millis()
+@calculation_service.route('/numeric-data/<string:category_id>', methods=['GET'])
+def process_number_request(category_id):
+    """Handle incoming number processing requests"""
+    request_start = timer.time()
 
     # Validate request category
-    if category_identifier not in SUPPORTED_CATEGORIES:
-        return json_response({"error": "Unsupported category"}, status=400)
+    if category_id not in SUPPORTED_NUMBER_TYPES:
+        reject_request(400, description="Unsupported number category")
 
-    # Retrieve numeric sequence
-    api_category = SUPPORTED_CATEGORIES[category_identifier]
-    received_sequence = retrieve_numeric_sequence(api_category)
+    # Asynchronously fetch numbers
+    api_category = SUPPORTED_NUMBER_TYPES[category_id]
+    future_task = task_handler.submit(retrieve_number_sequence, api_category)
+    try:
+        received_numbers = future_task.result(timeout=PROCESSING_DEADLINE)
+    except TimeoutError:
+        received_numbers = []
 
     # Update repository
-    prior_state, updated_state = manage_sliding_window(category_identifier, received_sequence)
+    prior_state, updated_state = update_data_repository(category_id, received_numbers)
 
-    # Compute statistical mean
-    calculated_mean = determine_mean_value(updated_state)
+    # Compute statistics
+    mean_value = compute_mean_value(updated_state)
 
-    # Construct API response
-    api_output = {
+    # Prepare output
+    service_response = {
         "previousWindowState": prior_state,
         "currentWindowState": updated_state,
-        "receivedNumbers": received_sequence,
-        "meanValue": calculated_mean
+        "receivedNumbers": received_numbers,
+        "averageValue": mean_value
     }
 
     # Verify processing time
-    elapsed_duration = time_utils.current_millis() - start_timestamp
-    if elapsed_duration > PROCESSING_DEADLINE:
-        return json_response({"error": "Processing timeout"}, status=500)
+    elapsed_time = timer.time() - request_start
+    if elapsed_time > PROCESSING_DEADLINE:
+        reject_request(500, description="Service timeout occurred")
 
-    return json_response(api_output)
+    return format_response(service_response)
+
+
+@calculation_service.errorhandler(400)
+@calculation_service.errorhandler(500)
+def handle_service_errors(error):
+    """Standardized error responses"""
+    return format_response({
+        "errorMessage": error.description,
+        "statusCode": error.code
+    }), error.code
 
 
 if __name__ == '__main__':
-    web_app.run(host='0.0.0.0', port=9876, concurrency=True)
+    calculation_service.run(host='0.0.0.0', port=9876, threaded=True)
